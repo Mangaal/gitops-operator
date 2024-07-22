@@ -97,6 +97,7 @@ replace (
 	github.com/openshift/api => github.com/openshift/api v0.0.0-20220929131120-2bde012f248a
 	github.com/openshift/client-go => github.com/openshift/client-go v0.0.0-20200325131901-f7baeb993edb
 	golang.org/x/net => golang.org/x/net v0.24.0
+	google.golang.org/protobuf => google.golang.org/protobuf v1.34.2
 	k8s.io/api => k8s.io/api v0.28.3
 	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.28.3
 	k8s.io/apimachinery => k8s.io/apimachinery v0.28.3
