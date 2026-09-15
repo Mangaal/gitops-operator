@@ -41,6 +41,18 @@ spec:
           value: ""
         - name: DISABLE_CLUSTER_TLS_PROFILE
           value: "false"
+        - name: ENABLE_AGENTIC_GITOPS_INTEGRATION
+          value: "true"
+        - name: AGENTIC_TRIGGER_TLS_ENABLED
+          value: "false"
+        - name: AGENTIC_RUN_NAMESPACE
+          value: openshift-lightspeed
+        - name: AGENTIC_RUN_COOLDOWN
+          value: 10m
+        - name: AGENTIC_ANALYSIS_AGENT
+          value: default
+        - name: AGENTIC_TRIGGER_IMAGE
+          value: quay.io/mangaal/agentic-trigger:latest
         image: controller:latest
         livenessProbe:
           httpGet:

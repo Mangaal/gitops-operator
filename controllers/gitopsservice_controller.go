@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"strings"
 
+	argov1alpha1 "github.com/argoproj-labs/argocd-operator/api/v1alpha1"
 	argoapp "github.com/argoproj-labs/argocd-operator/api/v1beta1"
 	argocommon "github.com/argoproj-labs/argocd-operator/common"
 	argocdcontroller "github.com/argoproj-labs/argocd-operator/controllers/argocd"
@@ -296,6 +297,10 @@ func (r *ReconcileGitopsService) Reconcile(ctx context.Context, request reconcil
 	}
 
 	if result, err := r.reconcileBackend(gitopsserviceNamespacedName, instance, reqLogger); err != nil {
+		return result, err
+	}
+
+	if result, err := r.reconcileAgenticTriggerService(gitopsserviceNamespacedName, instance, reqLogger); err != nil {
 		return result, err
 	}
 
@@ -1004,6 +1009,25 @@ func policyRuleForBackendServiceClusterRole() []rbacv1.PolicyRule {
 			Verbs: []string{
 				"get",
 				"list",
+				"patch",
+				"watch",
+			},
+		},
+		{
+			APIGroups: []string{
+				"agentic.openshift.io",
+			},
+			Resources: []string{
+				"agenticruns",
+				"agenticrunapprovals",
+				"analysisresults",
+				"escalationresults",
+				"executionresults",
+				"verificationresults",
+			},
+			Verbs: []string{
+				"get",
+				"list",
 				"watch",
 			},
 		},
@@ -1059,4 +1083,617 @@ func ensureInfraNodeSelectorAnnotation(namespace *corev1.Namespace, runOnInfra b
 		}
 	}
 	return false, namespace
+}
+
+const (
+	agenticTriggerServiceName    = "agentic-trigger"
+	agenticTriggerImageEnvName   = "AGENTIC_TRIGGER_IMAGE"
+	agenticTriggerDefaultImage   = "quay.io/redhat-developer/gitops-operator-agentic-trigger:latest"
+	agenticSkillsImageEnvName    = "AGENTIC_SKILLS_IMAGE"
+	agenticIntegrationEnabledEnv = "ENABLE_AGENTIC_GITOPS_INTEGRATION"
+	agenticTriggerTLSEnv         = "AGENTIC_TRIGGER_TLS_ENABLED"
+)
+
+func (r *ReconcileGitopsService) reconcileAgenticTriggerService(
+	gitopsserviceNamespacedName types.NamespacedName,
+	instance *pipelinesv1alpha1.GitopsService,
+	reqLogger logr.Logger,
+) (reconcile.Result, error) {
+
+	enabled := strings.EqualFold(os.Getenv(agenticIntegrationEnabledEnv), "true")
+	if !enabled {
+		if annotations := instance.GetAnnotations(); annotations != nil {
+			enabled = strings.EqualFold(annotations["gitops.openshift.io/agentic-integration-enabled"], "true")
+		}
+	}
+	if !enabled {
+		return reconcile.Result{}, nil
+	}
+
+	tlsEnabled := !strings.EqualFold(os.Getenv(agenticTriggerTLSEnv), "false")
+
+	ns := gitopsserviceNamespacedName.Namespace
+
+	// ServiceAccount
+	sa := newAgenticTriggerServiceAccount(ns)
+	if err := r.ensureResource(sa, "ServiceAccount", reqLogger); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// ClusterRole
+	cr := newAgenticTriggerClusterRole()
+	existingCR := &rbacv1.ClusterRole{}
+	if err := r.Client.Get(context.TODO(), types.NamespacedName{Name: cr.Name}, existingCR); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("Creating agentic-trigger ClusterRole", "Name", cr.Name)
+			if err := r.Client.Create(context.TODO(), cr); err != nil {
+				return reconcile.Result{}, err
+			}
+		} else {
+			return reconcile.Result{}, err
+		}
+	} else if !reflect.DeepEqual(existingCR.Rules, cr.Rules) {
+		existingCR.Rules = cr.Rules
+		reqLogger.Info("Updating agentic-trigger ClusterRole", "Name", cr.Name)
+		if err := r.Client.Update(context.TODO(), existingCR); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	// ClusterRoleBinding
+	crb := newAgenticTriggerClusterRoleBinding(ns)
+	if err := r.ensureResource(crb, "ClusterRoleBinding", reqLogger); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// Role in agentic run namespace for creating AgenticRuns
+	runNS := os.Getenv("AGENTIC_RUN_NAMESPACE")
+	if runNS == "" {
+		runNS = "openshift-lightspeed"
+	}
+	role := newAgenticTriggerRole(runNS)
+	existingRole := &rbacv1.Role{}
+	if err := r.Client.Get(context.TODO(), types.NamespacedName{Name: role.Name, Namespace: role.Namespace}, existingRole); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("Creating agentic-trigger Role", "Namespace", role.Namespace, "Name", role.Name)
+			if err := r.Client.Create(context.TODO(), role); err != nil {
+				return reconcile.Result{}, err
+			}
+		} else {
+			return reconcile.Result{}, err
+		}
+	} else if !reflect.DeepEqual(existingRole.Rules, role.Rules) {
+		existingRole.Rules = role.Rules
+		if err := r.Client.Update(context.TODO(), existingRole); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	// RoleBinding in agentic run namespace
+	rb := newAgenticTriggerRoleBinding(runNS, ns)
+	if err := r.ensureResource(rb, "RoleBinding", reqLogger); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// Deployment
+	deploy := newAgenticTriggerDeployment(ns, tlsEnabled)
+	existingDeploy := &appsv1.Deployment{}
+	if err := r.Client.Get(context.TODO(), types.NamespacedName{Name: deploy.Name, Namespace: deploy.Namespace}, existingDeploy); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("Creating agentic-trigger Deployment", "Namespace", deploy.Namespace)
+			if err := r.Client.Create(context.TODO(), deploy); err != nil {
+				return reconcile.Result{}, err
+			}
+		} else {
+			return reconcile.Result{}, err
+		}
+	} else {
+		changed := false
+		desiredImage := deploy.Spec.Template.Spec.Containers[0].Image
+		if existingDeploy.Spec.Template.Spec.Containers[0].Image != desiredImage {
+			existingDeploy.Spec.Template.Spec.Containers[0].Image = desiredImage
+			changed = true
+		}
+		if existingDeploy.Spec.Template.Spec.Containers[0].ImagePullPolicy != deploy.Spec.Template.Spec.Containers[0].ImagePullPolicy {
+			existingDeploy.Spec.Template.Spec.Containers[0].ImagePullPolicy = deploy.Spec.Template.Spec.Containers[0].ImagePullPolicy
+			changed = true
+		}
+		if !reflect.DeepEqual(existingDeploy.Spec.Template.Spec.Containers[0].Env, deploy.Spec.Template.Spec.Containers[0].Env) {
+			existingDeploy.Spec.Template.Spec.Containers[0].Env = deploy.Spec.Template.Spec.Containers[0].Env
+			changed = true
+		}
+		if changed {
+			reqLogger.Info("Updating agentic-trigger Deployment", "Namespace", deploy.Namespace)
+			if err := r.Client.Update(context.TODO(), existingDeploy); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+	}
+
+	// Service
+	svc := newAgenticTriggerService(ns, tlsEnabled)
+	existingSvc := &corev1.Service{}
+	if err := r.Client.Get(context.TODO(), types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}, existingSvc); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("Creating agentic-trigger Service", "Namespace", svc.Namespace)
+			if err := r.Client.Create(context.TODO(), svc); err != nil {
+				return reconcile.Result{}, err
+			}
+		} else {
+			return reconcile.Result{}, err
+		}
+	}
+
+	// Configure ArgoCD Notifications for automatic triggers
+	if err := r.ensureAgenticNotificationConfig(ns, tlsEnabled, reqLogger); err != nil {
+		reqLogger.Error(err, "failed to configure agentic notification trigger")
+	}
+
+	// Ensure SA token secret exists and inject into notifications secret
+	if err := r.ensureAgenticTriggerToken(ns, reqLogger); err != nil {
+		reqLogger.Error(err, "failed to ensure agentic-trigger token")
+	}
+
+	// Inject service-serving CA into argocd-tls-certs-cm (only needed when TLS is enabled)
+	if tlsEnabled {
+		if err := r.ensureAgenticTriggerTLSTrust(ns, reqLogger); err != nil {
+			reqLogger.Error(err, "failed to ensure agentic-trigger TLS trust")
+		}
+	}
+
+	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileGitopsService) ensureResource(obj client.Object, kind string, reqLogger logr.Logger) error {
+	key := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
+	existing := obj.DeepCopyObject().(client.Object)
+	if err := r.Client.Get(context.TODO(), key, existing); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("Creating "+kind, "Name", obj.GetName(), "Namespace", obj.GetNamespace())
+			return r.Client.Create(context.TODO(), obj)
+		}
+		return err
+	}
+	return nil
+}
+
+const (
+	agenticNotifTriggerKey      = "trigger.on-health-degraded"
+	agenticNotifTemplateKey     = "template.agentic-diagnose"
+	agenticNotifServiceKey      = "service.webhook.agentic-trigger"
+	agenticNotifSubscriptionKey = "subscriptions"
+
+	defaultNotificationsConfigurationName = "default-notifications-configuration"
+)
+
+func (r *ReconcileGitopsService) ensureAgenticNotificationConfig(namespace string, tlsEnabled bool, reqLogger logr.Logger) error {
+	nc := &argov1alpha1.NotificationsConfiguration{}
+
+	// Get the NotificationsConfiguration CR
+	ncName := defaultNotificationsConfigurationName
+	if err := r.Client.Get(context.TODO(), types.NamespacedName{Name: ncName, Namespace: namespace}, nc); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("NotificationsConfiguration CR not found, skipping agentic notification config", "Name", ncName, "Namespace", namespace)
+			return nil
+		}
+		return err
+	}
+
+	triggerValue := "- when: app.status.health.status == 'Degraded'\n  send: [agentic-diagnose]\n" +
+		"- when: app.status.health.status == 'Missing'\n  send: [agentic-diagnose]\n" +
+		"- when: app.status.health.status == 'Unknown'\n  send: [agentic-diagnose]\n"
+	templateValue := "webhook:\n  agentic-trigger:\n    method: POST\n    path: /api/v1/diagnose\n    body: |\n      {\"application\":\"{{.app.metadata.name}}\",\"applicationNamespace\":\"{{.app.metadata.namespace}}\",\"destinationNamespace\":\"{{.app.spec.destination.namespace}}\",\"syncStatus\":\"{{.app.status.sync.status}}\",\"healthStatus\":\"{{.app.status.health.status}}\",\"revision\":\"{{.app.status.sync.revision}}\"}\n"
+	var serviceValue string
+	if tlsEnabled {
+		serviceValue = fmt.Sprintf("url: https://%s.%s.svc:8443\nheaders:\n- name: Authorization\n  value: Bearer $agentic-trigger-token", agenticTriggerServiceName, namespace)
+	} else {
+		serviceValue = fmt.Sprintf("url: http://%s.%s.svc:8080\nheaders:\n- name: Authorization\n  value: Bearer $agentic-trigger-token", agenticTriggerServiceName, namespace)
+	}
+
+	changed := false
+
+	if nc.Spec.Triggers == nil {
+		nc.Spec.Triggers = make(map[string]string)
+	}
+	if nc.Spec.Triggers[agenticNotifTriggerKey] != triggerValue {
+		nc.Spec.Triggers[agenticNotifTriggerKey] = triggerValue
+		changed = true
+	}
+
+	if nc.Spec.Templates == nil {
+		nc.Spec.Templates = make(map[string]string)
+	}
+	if nc.Spec.Templates[agenticNotifTemplateKey] != templateValue {
+		nc.Spec.Templates[agenticNotifTemplateKey] = templateValue
+		changed = true
+	}
+
+	if nc.Spec.Services == nil {
+		nc.Spec.Services = make(map[string]string)
+	}
+	if nc.Spec.Services[agenticNotifServiceKey] != serviceValue {
+		nc.Spec.Services[agenticNotifServiceKey] = serviceValue
+		changed = true
+	}
+
+	// Global default subscription: all apps automatically receive on-health-degraded
+	// notifications via the agentic-trigger webhook (no per-app annotation needed).
+	subscriptionValue := "- recipients:\n  - agentic-trigger\n  triggers:\n  - on-health-degraded\n"
+	if nc.Spec.Subscriptions == nil {
+		nc.Spec.Subscriptions = make(map[string]string)
+	}
+	if nc.Spec.Subscriptions[agenticNotifSubscriptionKey] != subscriptionValue {
+		nc.Spec.Subscriptions[agenticNotifSubscriptionKey] = subscriptionValue
+		changed = true
+	}
+
+	if changed {
+		reqLogger.Info("Updating NotificationsConfiguration CR with agentic trigger config", "Name", ncName, "Namespace", namespace)
+		return r.Client.Update(context.TODO(), nc)
+	}
+	return nil
+}
+
+const (
+	agenticTriggerTokenSecretName = "agentic-trigger-token"
+	argocdNotificationsSecretName = "argocd-notifications-secret"
+	agenticTriggerTokenKey        = "agentic-trigger-token"
+)
+
+func (r *ReconcileGitopsService) ensureAgenticTriggerToken(namespace string, reqLogger logr.Logger) error {
+	// Step 1: Create a service-account-token Secret if it doesn't exist.
+	// Kubernetes will auto-populate the "token" field.
+	tokenSecret := &corev1.Secret{}
+	tokenSecretKey := types.NamespacedName{Name: agenticTriggerTokenSecretName, Namespace: namespace}
+	if err := r.Client.Get(context.TODO(), tokenSecretKey, tokenSecret); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("Creating agentic-trigger SA token Secret", "Namespace", namespace)
+			tokenSecret = &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      agenticTriggerTokenSecretName,
+					Namespace: namespace,
+					Annotations: map[string]string{
+						"kubernetes.io/service-account.name": agenticTriggerServiceName,
+					},
+				},
+				Type: corev1.SecretTypeServiceAccountToken,
+			}
+			if err := r.Client.Create(context.TODO(), tokenSecret); err != nil {
+				return err
+			}
+			// Token won't be populated yet on first create; will be picked up next reconcile
+			reqLogger.Info("SA token Secret created, token will be available on next reconcile")
+			return nil
+		}
+		return err
+	}
+
+	// Step 2: Read the auto-populated token from the Secret
+	token, ok := tokenSecret.Data["token"]
+	if !ok || len(token) == 0 {
+		reqLogger.Info("SA token not yet populated by Kubernetes, will retry on next reconcile")
+		return nil
+	}
+
+	// Step 3: Inject token into argocd-notifications-secret
+	notifSecret := &corev1.Secret{}
+	notifSecretKey := types.NamespacedName{Name: argocdNotificationsSecretName, Namespace: namespace}
+	if err := r.Client.Get(context.TODO(), notifSecretKey, notifSecret); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("argocd-notifications-secret not found, skipping token injection")
+			return nil
+		}
+		return err
+	}
+
+	existingToken, exists := notifSecret.Data[agenticTriggerTokenKey]
+	if exists && string(existingToken) == string(token) {
+		return nil
+	}
+
+	if notifSecret.Data == nil {
+		notifSecret.Data = make(map[string][]byte)
+	}
+	notifSecret.Data[agenticTriggerTokenKey] = token
+	reqLogger.Info("Injecting agentic-trigger token into argocd-notifications-secret")
+	return r.Client.Update(context.TODO(), notifSecret)
+}
+
+const (
+	argocdTLSCertsConfigMapName   = "argocd-tls-certs-cm"
+	serviceServingCABundleKey     = "service-ca.crt"
+	serviceServingCAAnnotation    = "service.beta.openshift.io/inject-cabundle"
+	agenticTriggerCAConfigMapName = "agentic-trigger-serving-ca"
+)
+
+func (r *ReconcileGitopsService) ensureAgenticTriggerTLSTrust(namespace string, reqLogger logr.Logger) error {
+	// Step 1: Ensure a ConfigMap exists with the inject-cabundle annotation.
+	// OpenShift auto-populates it with the service-serving CA bundle.
+	caBundleCM := &corev1.ConfigMap{}
+	caBundleCMKey := types.NamespacedName{Name: agenticTriggerCAConfigMapName, Namespace: namespace}
+	if err := r.Client.Get(context.TODO(), caBundleCMKey, caBundleCM); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("Creating ConfigMap for service-serving CA injection", "Namespace", namespace)
+			caBundleCM = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      agenticTriggerCAConfigMapName,
+					Namespace: namespace,
+					Annotations: map[string]string{
+						serviceServingCAAnnotation: "true",
+					},
+				},
+			}
+			if err := r.Client.Create(context.TODO(), caBundleCM); err != nil {
+				return err
+			}
+			reqLogger.Info("CA bundle ConfigMap created, will be populated by OpenShift on next reconcile")
+			return nil
+		}
+		return err
+	}
+
+	// Step 2: Read the injected CA bundle
+	caBundle, ok := caBundleCM.Data[serviceServingCABundleKey]
+	if !ok || len(caBundle) == 0 {
+		reqLogger.Info("Service-serving CA not yet injected, will retry on next reconcile")
+		return nil
+	}
+
+	// Step 3: Inject into argocd-tls-certs-cm under the service hostname
+	tlsCertsCM := &corev1.ConfigMap{}
+	tlsCertsKey := types.NamespacedName{Name: argocdTLSCertsConfigMapName, Namespace: namespace}
+	if err := r.Client.Get(context.TODO(), tlsCertsKey, tlsCertsCM); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("argocd-tls-certs-cm not found, skipping TLS trust injection")
+			return nil
+		}
+		return err
+	}
+
+	hostname := fmt.Sprintf("%s.%s.svc", agenticTriggerServiceName, namespace)
+	if tlsCertsCM.Data != nil && tlsCertsCM.Data[hostname] == caBundle {
+		return nil
+	}
+
+	if tlsCertsCM.Data == nil {
+		tlsCertsCM.Data = make(map[string]string)
+	}
+	tlsCertsCM.Data[hostname] = caBundle
+	reqLogger.Info("Injecting service-serving CA into argocd-tls-certs-cm", "hostname", hostname)
+	return r.Client.Update(context.TODO(), tlsCertsCM)
+}
+
+func newAgenticTriggerServiceAccount(namespace string) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agenticTriggerServiceName,
+			Namespace: namespace,
+		},
+	}
+}
+
+func newAgenticTriggerClusterRole() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: agenticTriggerServiceName,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"argoproj.io"},
+				Resources: []string{"applications"},
+				Verbs:     []string{"get", "patch"},
+			},
+			{
+				APIGroups: []string{"authentication.k8s.io"},
+				Resources: []string{"tokenreviews"},
+				Verbs:     []string{"create"},
+			},
+		},
+	}
+}
+
+func newAgenticTriggerClusterRoleBinding(namespace string) *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: agenticTriggerServiceName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      rbacv1.ServiceAccountKind,
+				Name:      agenticTriggerServiceName,
+				Namespace: namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     agenticTriggerServiceName,
+		},
+	}
+}
+
+func newAgenticTriggerRole(namespace string) *rbacv1.Role {
+	return &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agenticTriggerServiceName,
+			Namespace: namespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"agentic.openshift.io"},
+				Resources: []string{"agenticruns"},
+				Verbs:     []string{"create", "get", "list"},
+			},
+			{
+				APIGroups: []string{"agentic.openshift.io"},
+				Resources: []string{"agenticresults"},
+				Verbs:     []string{"get", "list"},
+			},
+		},
+	}
+}
+
+func newAgenticTriggerRoleBinding(namespace, saNamespace string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agenticTriggerServiceName,
+			Namespace: namespace,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      rbacv1.ServiceAccountKind,
+				Name:      agenticTriggerServiceName,
+				Namespace: saNamespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     agenticTriggerServiceName,
+		},
+	}
+}
+
+func newAgenticTriggerDeployment(namespace string, tlsEnabled bool) *appsv1.Deployment {
+	image := os.Getenv(agenticTriggerImageEnvName)
+	if image == "" {
+		image = agenticTriggerDefaultImage
+	}
+
+	replicas := int32(1)
+	labels := map[string]string{
+		"app.kubernetes.io/name":      agenticTriggerServiceName,
+		"app.kubernetes.io/component": "agentic-trigger",
+		"app.kubernetes.io/part-of":   "gitops-operator",
+	}
+
+	var args []string
+	var port int32
+	var portName string
+	var volumeMounts []corev1.VolumeMount
+	var volumes []corev1.Volume
+
+	if tlsEnabled {
+		port = 8443
+		portName = "https"
+		args = []string{"--addr=:8443", "--tls-cert=/etc/agentic-trigger/tls/tls.crt", "--tls-key=/etc/agentic-trigger/tls/tls.key"}
+		volumeMounts = []corev1.VolumeMount{
+			{
+				Name:      "tls",
+				MountPath: "/etc/agentic-trigger/tls",
+				ReadOnly:  true,
+			},
+		}
+		volumes = []corev1.Volume{
+			{
+				Name: "tls",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: agenticTriggerServiceName + "-tls",
+					},
+				},
+			},
+		}
+	} else {
+		port = 8080
+		portName = "http"
+		args = []string{"--addr=:8080", "--tls-enabled=false"}
+	}
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agenticTriggerServiceName,
+			Namespace: namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: agenticTriggerServiceName,
+					Containers: []corev1.Container{
+						{
+							Name:            agenticTriggerServiceName,
+							Image:           image,
+							ImagePullPolicy: corev1.PullAlways,
+							Args:            args,
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: port,
+									Name:          portName,
+									Protocol:      corev1.ProtocolTCP,
+								},
+							},
+							Env: []corev1.EnvVar{
+								{Name: "AGENTIC_RUN_NAMESPACE", Value: envOrDefaultCtrl("AGENTIC_RUN_NAMESPACE", "openshift-lightspeed")},
+								{Name: "AGENTIC_RUN_COOLDOWN", Value: envOrDefaultCtrl("AGENTIC_RUN_COOLDOWN", "10m")},
+								{Name: "AGENTIC_ANALYSIS_AGENT", Value: envOrDefaultCtrl("AGENTIC_ANALYSIS_AGENT", "default")},
+								{Name: agenticSkillsImageEnvName, Value: os.Getenv(agenticSkillsImageEnvName)},
+							},
+							VolumeMounts: volumeMounts,
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resourcev1.MustParse("10m"),
+									corev1.ResourceMemory: resourcev1.MustParse("32Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resourcev1.MustParse("100m"),
+									corev1.ResourceMemory: resourcev1.MustParse("128Mi"),
+								},
+							},
+						},
+					},
+					Volumes: volumes,
+				},
+			},
+		},
+	}
+}
+
+func newAgenticTriggerService(namespace string, tlsEnabled bool) *corev1.Service {
+	var port int32
+	var portName string
+	annotations := map[string]string{}
+
+	if tlsEnabled {
+		port = 8443
+		portName = "https"
+		annotations["service.beta.openshift.io/serving-cert-secret-name"] = agenticTriggerServiceName + "-tls"
+	} else {
+		port = 8080
+		portName = "http"
+	}
+
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        agenticTriggerServiceName,
+			Namespace:   namespace,
+			Annotations: annotations,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				"app.kubernetes.io/name": agenticTriggerServiceName,
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       portName,
+					Port:       port,
+					TargetPort: intstr.FromInt32(port),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
+func envOrDefaultCtrl(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

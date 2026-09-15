@@ -6,8 +6,8 @@
 VERSION ?= ""
 
 
-# Try to detect Docker or Podman
-CONTAINER_RUNTIME := $(shell command -v docker 2> /dev/null || command -v podman 2> /dev/null)
+# Try to detect Docker or Podman (override with: make CONTAINER_RUNTIME=podman ...)
+CONTAINER_RUNTIME ?= $(shell command -v docker 2> /dev/null || command -v podman 2> /dev/null)
 
 # If neither Docker nor Podman is found, print an error message and exit
 ifeq ($(CONTAINER_RUNTIME),)
@@ -61,6 +61,10 @@ endif
 
 # Image URL to use all building/pushing image targets
 IMG ?= $(IMAGE):$(VERSION)
+
+# Agentic integration images (override for local builds, e.g. quay.io/<user>/...)
+AGENTIC_TRIGGER_IMG ?= quay.io/mangaal/agentic-trigger:latest
+PLATFORM ?= linux/amd64
 
 # Set the Operator SDK version to use.
 # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
@@ -184,11 +188,29 @@ run: manifests generate fmt vet ## Run a controller from your host.
 
 .PHONY: docker-build
 docker-build: test ## Build container image with the manager.
-	$(CONTAINER_RUNTIME) build -t ${IMG} .
+	$(CONTAINER_RUNTIME) build --platform $(PLATFORM) -t ${IMG} .
+
+.PHONY: docker-build-no-test
+docker-build-no-test: ## Build container image with the manager (skip unit tests).
+	$(CONTAINER_RUNTIME) build --platform $(PLATFORM) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push container image with the manager.
 	$(CONTAINER_RUNTIME) push ${IMG}
+
+.PHONY: docker-build-agentic-trigger
+docker-build-agentic-trigger: ## Build the agentic-trigger container image.
+	$(CONTAINER_RUNTIME) build --platform $(PLATFORM) -f Dockerfile.agentic-trigger -t $(AGENTIC_TRIGGER_IMG) .
+
+.PHONY: docker-push-agentic-trigger
+docker-push-agentic-trigger: ## Push the agentic-trigger container image.
+	$(CONTAINER_RUNTIME) push $(AGENTIC_TRIGGER_IMG)
+
+.PHONY: docker-build-all
+docker-build-all: docker-build docker-build-agentic-trigger ## Build operator and agentic-trigger images.
+
+.PHONY: docker-push-all
+docker-push-all: docker-push docker-push-agentic-trigger ## Push operator and agentic-trigger images.
 
 ##@ Build Dependencies
 

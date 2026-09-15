@@ -525,6 +525,12 @@ spec:
           - update
           - watch
         - apiGroups:
+          - authentication.k8s.io
+          resources:
+          - tokenreviews
+          verbs:
+          - create
+        - apiGroups:
           - argoproj.io
           resources:
           - applications
@@ -877,6 +883,16 @@ spec:
                 - name: LABEL_SELECTOR
                 - name: DISABLE_CLUSTER_TLS_PROFILE
                   value: "false"
+                - name: ENABLE_AGENTIC_GITOPS_INTEGRATION
+                  value: "false"
+                - name: AGENTIC_RUN_NAMESPACE
+                  value: openshift-lightspeed
+                - name: AGENTIC_RUN_COOLDOWN
+                  value: 10m
+                - name: AGENTIC_ANALYSIS_AGENT
+                  value: default
+                - name: AGENTIC_TRIGGER_IMAGE
+                  value: quay.io/redhat-developer/gitops-operator-agentic-trigger:latest
                 - name: ENABLE_CONVERSION_WEBHOOK
                   value: "true"
                 image: quay.io/redhat-developer/gitops-operator:latest
