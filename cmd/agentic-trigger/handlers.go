@@ -146,7 +146,6 @@ func (s *TriggerService) HandleDiagnose(w http.ResponseWriter, r *http.Request) 
 		logger.Error(err, "failed to annotate application (non-fatal)")
 	}
 
-	s.dedup.TryRecord(dedupKey)
 	logger.Info("created AgenticRun", "name", runName, "trigger", caller.TriggerType)
 
 	writeJSON(w, http.StatusCreated, DiagnoseResponse{
