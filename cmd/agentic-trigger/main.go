@@ -60,6 +60,15 @@ func main() {
 		logger:     logger,
 	}
 
+	// Periodically clean up expired dedup entries
+	go func() {
+		ticker := time.NewTicker(config.Cooldown)
+		defer ticker.Stop()
+		for range ticker.C {
+			svc.dedup.Cleanup()
+		}
+	}()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/diagnose", svc.HandleDiagnose)
 	mux.HandleFunc("GET /api/v1/applications/{namespace}/{name}/diagnosis", svc.HandleDiagnosis)

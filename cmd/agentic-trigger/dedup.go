@@ -18,22 +18,20 @@ func NewDedupCache(cooldown time.Duration) *DedupCache {
 	}
 }
 
-func (d *DedupCache) ShouldAllow(key string) bool {
+func (d *DedupCache) TryRecord(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	now := time.Now()
+
 	if last, ok := d.entries[key]; ok {
-		if time.Since(last) < d.cooldown {
+		if now.Sub(last) < d.cooldown {
 			return false
 		}
 	}
-	return true
-}
 
-func (d *DedupCache) Record(key string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.entries[key] = time.Now()
+	d.entries[key] = now
+	return true
 }
 
 func (d *DedupCache) Cleanup() {

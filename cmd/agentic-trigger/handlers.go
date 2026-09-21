@@ -63,10 +63,10 @@ func (s *TriggerService) HandleDiagnose(w http.ResponseWriter, r *http.Request) 
 	)
 
 	// --- Policy check using payload ---
-	if caller.TriggerType == triggerAutomatic && !qualifiesForAutomatic(req.HealthStatus) {
+	if caller.TriggerType == triggerAutomatic && !qualifiesForAutomatic(req.SyncStatus, req.HealthStatus) {
 		writeJSON(w, http.StatusOK, DiagnoseResponse{
 			Accepted: false,
-			Reason:   fmt.Sprintf("health status %q does not qualify for automatic diagnosis", req.HealthStatus),
+			Reason:   fmt.Sprintf("application %q does not qualify for automatic diagnosis", name),
 		})
 		return
 	}
@@ -101,7 +101,7 @@ func (s *TriggerService) HandleDiagnose(w http.ResponseWriter, r *http.Request) 
 
 	signature := buildSignature(appUID, syncStatus, healthStatus, revision)
 	dedupKey := buildDedupKey(appUID, signature)
-	if !s.dedup.ShouldAllow(dedupKey) {
+	if !s.dedup.TryRecord(dedupKey) {
 		writeJSON(w, http.StatusOK, DiagnoseResponse{
 			Accepted: false,
 			Reason:   "cooldown active for this application state",
@@ -146,7 +146,7 @@ func (s *TriggerService) HandleDiagnose(w http.ResponseWriter, r *http.Request) 
 		logger.Error(err, "failed to annotate application (non-fatal)")
 	}
 
-	s.dedup.Record(dedupKey)
+	s.dedup.TryRecord(dedupKey)
 	logger.Info("created AgenticRun", "name", runName, "trigger", caller.TriggerType)
 
 	writeJSON(w, http.StatusCreated, DiagnoseResponse{
@@ -295,17 +295,15 @@ func (s *TriggerService) getAgenticResult(ctx context.Context, runName string) (
 	return s.dynClient.Resource(agenticResultGVR).Namespace(s.config.RunNamespace).Get(ctx, runName, metav1.GetOptions{})
 }
 
-func qualifiesForAutomatic(healthStatus string) bool {
-	switch strings.ToLower(healthStatus) {
-	case "degraded":
+func qualifiesForAutomatic(syncStatus, healthStatus string) bool {
+	if syncStatus == "OutOfSync" {
 		return true
-	case "unknown":
-		return true
-	case "missing":
-		return true
-	default:
-		return false
 	}
+	switch strings.ToLower(healthStatus) {
+	case "Degraded", "Unknown", "Missing":
+		return true
+	}
+	return false
 }
 
 type AgenticRunParams struct {
